@@ -1,0 +1,1062 @@
+################################################################################
+### Script 05: GSEA Analysis for Unique Genes per Cell Line
+################################################################################
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(org.Mm.eg.db)
+  library(org.Hs.eg.db)
+  library(DOSE)
+  library(pathview)
+  library(ggplot2)
+  library(patchwork)
+  library(msigdbr)  # For MSigDB gene sets
+  library(fgsea)     # Fast GSEA implementation
+  library(data.table)
+  library(RColorBrewer)
+})
+
+################################################################################
+### SECTION 1: DATA LOADING AND PREPARATION
+################################################################################
+
+#' Load gene data for a cell line (either unique or all DEGs)
+#'  Explicitly excludes Tg_24hv6h comparisons
+#' @param cell_line Name of the cell line
+#' @param input_path Path to gene files
+#' @param time_point Which time point to use ("6h" or "24h")
+#' @param gene_type "unique" for unique genes only, "all" for all genes
+#' @param ranking_metric "logFC", "pvalue", or "combined"
+#' @return Data frame with genes and their statistics
+load_gene_data <- function(cell_line, 
+                          input_path = "edgeR_output",
+                          time_point = "6h",  # Removed "both" option
+                          gene_type = "unique",
+                          ranking_metric = "logFC") {
+  
+  # Validate time_point
+  if (!time_point %in% c("6h", "24h")) {
+    stop("time_point must be either '6h' or '24h'")
+  }
+  
+  # Select appropriate file based on gene_type
+  if (gene_type == "unique") {
+    # First try the combined file
+    data_file <- file.path(input_path, paste0("Unique_genes_", cell_line, ".txt"))
+    
+    # If combined file doesn't exist, try time-specific file
+    if (!file.exists(data_file)) {
+      data_file <- file.path(input_path, paste0("Unique_genes_", cell_line, "_", time_point, ".txt"))
+    }
+  } else {  # "all"
+    # Use the main edgeR output file with all genes
+    data_file <- file.path(input_path, paste0(cell_line, "_edgeR_output.txt"))
+    if (!file.exists(data_file)) {
+      # Try the TPM output file which has all the edgeR results
+      data_file <- file.path(input_path, paste0(cell_line, "_edgeR_TPM_output.txt"))
+    }
+  }
+  
+  if (!file.exists(data_file)) {
+    warning(paste("File not found for", cell_line, ":", data_file))
+    return(NULL)
+  }
+  
+  # Load data
+  gene_data <- read.delim(data_file, stringsAsFactors = FALSE)
+  
+  if (nrow(gene_data) == 0) {
+    warning(paste("No genes for", cell_line))
+    return(NULL)
+  }
+  
+  # Only use TgvDMSO comparisons, not Tg_24hv6h
+  # Select appropriate columns based on time point
+  if (time_point == "6h") {
+    logfc_col <- paste0("logFC_TgvDMSO_6h_", cell_line)
+    fdr_col <- paste0("FDR_TgvDMSO_6h_", cell_line)
+    pval_col <- paste0("PValue_TgvDMSO_6h_", cell_line)
+  } else if (time_point == "24h") {
+    logfc_col <- paste0("logFC_TgvDMSO_24h_", cell_line)
+    fdr_col <- paste0("FDR_TgvDMSO_24h_", cell_line)
+    pval_col <- paste0("PValue_TgvDMSO_24h_", cell_line)
+  }
+  
+  # Check if columns exist
+  if (!logfc_col %in% colnames(gene_data)) {
+    warning(paste("LogFC column not found:", logfc_col))
+    return(NULL)
+  }
+  
+  # Prepare final data
+  result <- data.frame(
+    gene = gene_data$genes,
+    logFC = as.numeric(gene_data[[logfc_col]]),
+    FDR = if(fdr_col %in% colnames(gene_data)) as.numeric(gene_data[[fdr_col]]) else NA,
+    PValue = if(pval_col %in% colnames(gene_data)) as.numeric(gene_data[[pval_col]]) else NA,
+    stringsAsFactors = FALSE
+  )
+  
+  # Remove rows with NA logFC
+  result <- result[!is.na(result$logFC), ]
+  
+  # For "all" gene type, optionally filter to only significant DEGs
+  # This ensures we're focusing on genes that actually respond to treatment
+  if (gene_type == "all" && !all(is.na(result$FDR))) {
+    # Optional: Keep all genes for GSEA (which uses the full ranking)
+    # Or filter to DEGs only (uncomment below to filter)
+    # result <- result[result$FDR < 0.05, ]
+    message(paste("  Total genes:", nrow(result), 
+                  "| DEGs (FDR<0.05):", sum(result$FDR < 0.05, na.rm = TRUE)))
+  }
+  
+  # Create ranking metric for GSEA
+  # Multiple options available - choose based on preference
+  
+  # Option 1: Use log fold change directly (most similar to Broad GSEA)
+  result$rank_metric_logfc <- result$logFC
+  
+  # Option 2: Combine fold change magnitude with significance
+  if (!all(is.na(result$PValue))) {
+    result$rank_metric_combined <- result$logFC * -log10(pmax(result$PValue, 1e-16))
+  } else if (!all(is.na(result$FDR))) {
+    result$rank_metric_combined <- result$logFC * -log10(pmax(result$FDR, 1e-16))
+  } else {
+    result$rank_metric_combined <- result$logFC
+  }
+  
+  # Option 3: Traditional significance-based ranking
+  if (!all(is.na(result$PValue))) {
+    result$rank_metric_pvalue <- -log10(pmax(result$PValue, 1e-300)) * sign(result$logFC)
+  } else if (!all(is.na(result$FDR))) {
+    result$rank_metric_pvalue <- -log10(pmax(result$FDR, 1e-300)) * sign(result$logFC)
+  } else {
+    result$rank_metric_pvalue <- result$logFC
+  }
+  
+  # Select the requested ranking metric
+  if (ranking_metric == "logFC") {
+    result$rank_metric <- result$rank_metric_logfc
+  } else if (ranking_metric == "combined") {
+    result$rank_metric <- result$rank_metric_combined
+  } else if (ranking_metric == "pvalue") {
+    result$rank_metric <- result$rank_metric_pvalue
+  } else {
+    result$rank_metric <- result$rank_metric_logfc
+  }
+  
+  # Remove genes with rank_metric = 0 or NA
+  result <- result[!is.na(result$rank_metric) & result$rank_metric != 0, ]
+  
+  return(result)
+}
+
+################################################################################
+### SECTION 2: GENE SET PREPARATION
+################################################################################
+
+#' Convert list columns to character for writing to file
+#' @param df Data frame potentially containing list columns
+#' @return Data frame with list columns converted to character
+convert_list_columns_to_char <- function(df) {
+  # Identify which columns are lists
+  list_cols <- sapply(df, is.list)
+  
+  if (any(list_cols)) {
+    # Convert each list column to character
+    for (col in names(df)[list_cols]) {
+      df[[col]] <- vapply(df[[col]], 
+                         function(x) paste(x, collapse = ", "), 
+                         character(1L))
+    }
+  }
+  
+  return(df)
+}
+
+#' Get MSigDB gene sets for mouse
+#' @param category MSigDB category (e.g., "H", "C2", "C5")
+#' @param subcategory MSigDB subcategory (e.g., "GO:BP", "KEGG")
+#' @return List of gene sets
+get_msigdb_genesets <- function(category = "H", subcategory = NULL) {
+  
+  message(paste("  Loading MSigDB", category, subcategory, "gene sets..."))
+  
+  # Get mouse gene sets from MSigDB
+  if (!is.null(subcategory)) {
+    m_df <- msigdbr(species = "Mus musculus", category = category, subcategory = subcategory)
+  } else {
+    m_df <- msigdbr(species = "Mus musculus", category = category)
+  }
+  
+  # Convert to list format for GSEA
+  genesets <- split(m_df$gene_symbol, m_df$gs_name)
+  
+  message(paste("    Loaded", length(genesets), "gene sets"))
+  
+  return(genesets)
+}
+
+#' Prepare multiple gene set collections
+#' @return List of gene set collections
+prepare_gene_set_collections <- function() {
+  
+  collections <- list()
+  
+  tryCatch({
+    # Hallmark gene sets
+    collections$Hallmark <- get_msigdb_genesets("H")
+  }, error = function(e) {
+    message("    Could not load Hallmark gene sets")
+  })
+  
+  tryCatch({
+    # KEGG pathways
+    collections$KEGG <- get_msigdb_genesets("C2", "CP:KEGG")
+  }, error = function(e) {
+    message("    Could not load KEGG gene sets")
+  })
+  
+  tryCatch({
+    # Reactome pathways
+    collections$Reactome <- get_msigdb_genesets("C2", "CP:REACTOME")
+  }, error = function(e) {
+    message("    Could not load Reactome gene sets")
+  })
+  
+  tryCatch({
+    # GO Biological Process
+    collections$GO_BP <- get_msigdb_genesets("C5", "GO:BP")
+  }, error = function(e) {
+    message("    Could not load GO BP gene sets")
+  })
+  
+  tryCatch({
+    # GO Molecular Function
+    collections$GO_MF <- get_msigdb_genesets("C5", "GO:MF")
+  }, error = function(e) {
+    message("    Could not load GO MF gene sets")
+  })
+  
+  return(collections)
+}
+
+################################################################################
+### SECTION 3: GSEA ANALYSIS
+################################################################################
+
+#' Run GSEA analysis using fgsea
+#' @param gene_data Data frame with genes and ranking metric
+#' @param gene_sets List of gene sets
+#' @param min_size Minimum gene set size
+#' @param max_size Maximum gene set size
+#' @return GSEA results
+run_fgsea <- function(gene_data, gene_sets, min_size = 10, max_size = 500) {
+  
+  # Create ranked list
+  ranks <- gene_data$rank_metric
+  names(ranks) <- gene_data$gene
+  ranks <- sort(ranks, decreasing = TRUE)
+  
+  # Run fgsea
+  fgsea_results <- fgsea(
+    pathways = gene_sets,
+    stats = ranks,
+    minSize = min_size,
+    maxSize = max_size,
+    eps = 0
+  )
+  
+  # Add direction
+  fgsea_results$direction <- ifelse(fgsea_results$NES > 0, "Activated", "Suppressed")
+  
+  return(as.data.frame(fgsea_results))
+}
+
+#' Run GSEA for all gene set collections
+#' @param gene_data Data frame with genes and ranking
+#' @param collections List of gene set collections
+#' @param pval_cutoff P-value cutoff for significance
+#' @return Combined GSEA results
+run_comprehensive_gsea <- function(gene_data, collections, pval_cutoff = 0.05) {
+  
+  all_results <- list()
+  
+  for (collection_name in names(collections)) {
+    message(paste("    Running GSEA on", collection_name, "..."))
+    
+    results <- run_fgsea(gene_data, collections[[collection_name]])
+    
+    # Filter significant results
+    sig_results <- results[results$padj < pval_cutoff, ]
+    
+    if (nrow(sig_results) > 0) {
+      sig_results$collection <- collection_name
+      all_results[[collection_name]] <- sig_results
+      
+      message(paste("      Found", 
+                   sum(sig_results$direction == "Activated"), "activated and",
+                   sum(sig_results$direction == "Suppressed"), "suppressed pathways"))
+    }
+  }
+  
+  if (length(all_results) > 0) {
+    combined_results <- do.call(rbind, all_results)
+    return(combined_results)
+  } else {
+    return(NULL)
+  }
+}
+
+################################################################################
+### SECTION 4: VISUALIZATION FUNCTIONS
+################################################################################
+
+#' Create GSEA dot plot
+#' @param gsea_results GSEA results data frame
+#' @param direction "Activated", "Suppressed", or "both"
+#' @param top_n Number of top pathways to show
+#' @param title Plot title
+#' @return ggplot object
+create_gsea_dotplot <- function(gsea_results, direction = "both", 
+                                top_n = 20, title = NULL) {
+  
+  # Filter by direction
+  if (direction != "both") {
+    gsea_results <- gsea_results[gsea_results$direction == direction, ]
+  }
+  
+  if (nrow(gsea_results) == 0) {
+    return(NULL)
+  }
+  
+  # Select top pathways by absolute NES
+  gsea_results <- gsea_results[order(abs(gsea_results$NES), decreasing = TRUE), ]
+  gsea_results <- head(gsea_results, top_n)
+  
+  # Clean pathway names (remove prefixes)
+  gsea_results$pathway_clean <- gsub("^[A-Z]+_", "", gsea_results$pathway)
+  gsea_results$pathway_clean <- gsub("_", " ", gsea_results$pathway_clean)
+  gsea_results$pathway_clean <- stringr::str_to_title(gsea_results$pathway_clean)
+  
+  # Truncate long names
+  gsea_results$pathway_clean <- ifelse(
+    nchar(gsea_results$pathway_clean) > 50,
+    paste0(substr(gsea_results$pathway_clean, 1, 47), "..."),
+    gsea_results$pathway_clean
+  )
+  
+  # Create plot
+  p <- ggplot(gsea_results, aes(x = NES, y = reorder(pathway_clean, NES))) +
+    geom_point(aes(size = -log10(padj), color = NES)) +
+    scale_color_gradient2(
+      low = "blue", mid = "white", high = "red",
+      midpoint = 0, name = "NES"
+    ) +
+    scale_size_continuous(
+      name = "-log10(FDR)",
+      range = c(2, 8)
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 10),
+      axis.text.x = element_text(size = 11),
+      axis.title = element_text(size = 12, face = "bold"),
+      legend.title = element_text(size = 11, face = "bold"),
+      panel.grid.major.y = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA)
+    ) +
+    labs(
+      x = "Normalized Enrichment Score (NES)",
+      y = "Pathway",
+      title = title
+    )
+  
+  # Add collection labels if multiple collections
+  if ("collection" %in% colnames(gsea_results) && 
+      length(unique(gsea_results$collection)) > 1) {
+    p <- p + facet_wrap(~ collection, scales = "free_y", ncol = 1)
+  }
+  
+  return(p)
+}
+
+#' Create combined GSEA plot with activated and suppressed pathways
+#' @param gsea_results GSEA results
+#' @param cell_line Cell line name
+#' @param top_n Number of top pathways per direction
+#' @return Combined plot
+create_combined_gsea_plot <- function(gsea_results, cell_line, top_n = 15) {
+  
+  # Create activated pathways plot
+  p_activated <- create_gsea_dotplot(
+    gsea_results,
+    direction = "Activated",
+    top_n = top_n,
+    title = paste(cell_line, "- Activated Pathways")
+  )
+  
+  # Create suppressed pathways plot
+  p_suppressed <- create_gsea_dotplot(
+    gsea_results,
+    direction = "Suppressed",
+    top_n = top_n,
+    title = paste(cell_line, "- Suppressed Pathways")
+  )
+  
+  # Combine plots
+  if (!is.null(p_activated) && !is.null(p_suppressed)) {
+    combined <- p_activated | p_suppressed
+  } else if (!is.null(p_activated)) {
+    combined <- p_activated
+  } else if (!is.null(p_suppressed)) {
+    combined <- p_suppressed
+  } else {
+    combined <- NULL
+  }
+  
+  return(combined)
+}
+
+################################################################################
+### SECTION 5: SUMMARY FUNCTIONS
+################################################################################
+
+#' Generate GSEA summary table
+#' @param all_results List of GSEA results for all cell lines
+#' @param output_path Path to save summary
+#' @return Summary data frame
+generate_gsea_summary <- function(all_results, output_path) {
+  
+  summary_list <- list()
+  
+  for (cell_line in names(all_results)) {
+    if (!is.null(all_results[[cell_line]])) {
+      results <- all_results[[cell_line]]
+      
+      # Count by collection and direction
+      if ("collection" %in% colnames(results)) {
+        summary_by_collection <- results %>%
+          group_by(collection, direction) %>%
+          summarise(
+            n_pathways = n(),
+            mean_NES = mean(NES),
+            .groups = 'drop'
+          ) %>%
+          mutate(cell_line = cell_line)
+        
+        summary_list[[cell_line]] <- summary_by_collection
+      }
+    }
+  }
+  
+  if (length(summary_list) > 0) {
+    summary_df <- do.call(rbind, summary_list)
+    
+    # Convert any list columns before saving
+    summary_df <- convert_list_columns_to_char(summary_df)
+    
+    # Save summary
+    write.table(summary_df,
+                file.path(output_path, "GSEA_summary_statistics.txt"),
+                sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    return(summary_df)
+  }
+  
+  return(NULL)
+}
+
+################################################################################
+### SECTION 6: MAIN ANALYSIS WORKFLOW
+################################################################################
+
+#' Run complete GSEA analysis for all cell lines
+#'  Removed "both" option for time_point, properly handles 6h and 24h separately
+#' @param cell_lines Vector of cell line names
+#' @param time_point Time point to use ("6h" or "24h")
+#' @param gene_type "unique" for unique genes only, "all" for all DEGs, or "both"
+#' @param ranking_metric "logFC" (Broad-like), "pvalue", or "combined"
+#' @param output_path Path to save results
+#' @param use_collections Which gene set collections to use
+#' @return List of all results
+run_gsea_analysis <- function(cell_lines = c("MIN6", "aTC1", "MGN3", "GLUTag", "PCCL3", "QGP1"),
+                             time_point = "6h",  #  Must be "6h" or "24h"
+                             gene_type = "both",  # Can be "unique", "all", or "both"
+                             ranking_metric = "logFC",  # Choose ranking method
+                             output_path = "analysis/GSEA_results",
+                             use_collections = c("Hallmark", "KEGG", "GO_BP")) {
+  
+  message("\n========================================")
+  message(paste("Starting GSEA Analysis for", time_point, "time point"))
+  message("========================================\n")
+  message(paste("Ranking metric:", ranking_metric))
+  message(paste("  logFC = fold change magnitude (like Broad GSEA)"))
+  message(paste("  combined = logFC × -log10(p-value)"))
+  message(paste("  pvalue = -log10(p-value) × sign(logFC)\n"))
+  
+  # Validate time_point
+  if (!time_point %in% c("6h", "24h")) {
+    stop("time_point must be either '6h' or '24h'")
+  }
+  
+  # Analyze all DEGs for GSEA
+  if (gene_type == "both" || gene_type == "unique") {
+    gene_types_to_analyze <- c("all")
+    if (gene_type == "unique") {
+      message("Note: GSEA requires full ranked gene lists. Analyzing all DEGs instead of unique genes only.")
+    }
+  } else {
+    gene_types_to_analyze <- gene_type
+  }
+  
+  # Store results for all analyses
+  master_results <- list()
+  
+  for (current_gene_type in gene_types_to_analyze) {
+    
+    message(paste("\n--- Analyzing", 
+                 ifelse(current_gene_type == "unique", "UNIQUE genes", "ALL DEGs"),
+                 "at", time_point, "---\n"))
+    
+    # Create output subdirectory for this gene type
+    current_output_path <- file.path(output_path, 
+                                     ifelse(current_gene_type == "unique", 
+                                           "unique_genes", "all_DEGs"))
+    dir.create(current_output_path, showWarnings = FALSE, recursive = TRUE)
+    
+    # Load gene set collections
+    message("Loading gene set collections...")
+    all_collections <- prepare_gene_set_collections()
+    
+    # Filter to requested collections
+    collections <- all_collections[names(all_collections) %in% use_collections]
+    
+    if (length(collections) == 0) {
+      warning("No valid gene set collections loaded")
+      next
+    }
+    
+    # Store all results
+    all_results <- list()
+    all_plots <- list()
+    
+    # Process each cell line
+    for (cell_line in cell_lines) {
+      message(paste("\nProcessing", cell_line, "..."))
+      
+      # Load gene data -  Now properly uses single time point
+      gene_data <- load_gene_data(cell_line, 
+                                  time_point = time_point,
+                                  gene_type = current_gene_type,
+                                  ranking_metric = ranking_metric)
+      
+      if (is.null(gene_data)) {
+        message(paste("  Skipping", cell_line, "- no data"))
+        next
+      }
+      
+      message(paste("  Loaded", nrow(gene_data), 
+                   ifelse(current_gene_type == "unique", "unique genes", "genes total")))
+      
+      # For all DEGs, report how many are significant
+      if (current_gene_type == "all" && "FDR" %in% colnames(gene_data)) {
+        n_sig <- sum(gene_data$FDR < 0.05, na.rm = TRUE)
+        message(paste("    (", n_sig, "genes with FDR < 0.05)"))
+      }
+      
+      # Run GSEA
+      message("  Running GSEA...")
+      gsea_results <- run_comprehensive_gsea(gene_data, collections)
+      
+      if (!is.null(gsea_results)) {
+        all_results[[cell_line]] <- gsea_results
+        
+        # Convert list columns before saving
+        gsea_results_writable <- convert_list_columns_to_char(gsea_results)
+        
+        # Save detailed results
+        write.table(gsea_results_writable,
+                    file.path(current_output_path, 
+                             paste0(cell_line, "_GSEA_results.txt")),
+                    sep = "\t", row.names = FALSE, quote = FALSE)
+        
+        # Create and save plots
+        message("  Creating plots...")
+        
+        # 1. Combined activated/suppressed plot
+        p_combined <- create_combined_gsea_plot(gsea_results, cell_line, top_n = 15)
+        if (!is.null(p_combined)) {
+          ggsave(file.path(current_output_path, 
+                          paste0(cell_line, "_GSEA_combined.svg")),
+                 plot = p_combined, width = 16, height = 10, dpi = 300)
+          all_plots[[paste0(cell_line, "_combined")]] <- p_combined
+        }
+        
+        # 2. Separate plots for activated pathways
+        p_activated <- create_gsea_dotplot(gsea_results, direction = "Activated", 
+                                           top_n = 25,
+                                           title = paste(cell_line, "- Activated Pathways",
+                                                       ifelse(current_gene_type == "unique", 
+                                                             "(Unique Genes)", "(All DEGs)"),
+                                                       "at", time_point))
+        if (!is.null(p_activated)) {
+          ggsave(file.path(current_output_path, 
+                          paste0(cell_line, "_GSEA_activated.svg")),
+                 plot = p_activated, width = 10, height = 12, dpi = 300)
+          all_plots[[paste0(cell_line, "_activated")]] <- p_activated
+        }
+        
+        # 3. Separate plots for suppressed pathways
+        p_suppressed <- create_gsea_dotplot(gsea_results, direction = "Suppressed",
+                                            top_n = 25,
+                                            title = paste(cell_line, "- Suppressed Pathways",
+                                                        ifelse(current_gene_type == "unique", 
+                                                              "(Unique Genes)", "(All DEGs)"),
+                                                        "at", time_point))
+        if (!is.null(p_suppressed)) {
+          ggsave(file.path(current_output_path, 
+                          paste0(cell_line, "_GSEA_suppressed.svg")),
+                 plot = p_suppressed, width = 10, height = 12, dpi = 300)
+          all_plots[[paste0(cell_line, "_suppressed")]] <- p_suppressed
+        }
+        
+        # 4. Create plots by collection
+        for (collection in unique(gsea_results$collection)) {
+          collection_data <- gsea_results[gsea_results$collection == collection, ]
+          
+          p_collection <- create_gsea_dotplot(
+            collection_data, 
+            direction = "both",
+            top_n = 30,
+            title = paste(cell_line, "-", collection,
+                         ifelse(current_gene_type == "unique", 
+                               "(Unique Genes)", "(All DEGs)"),
+                         "at", time_point)
+          )
+          
+          if (!is.null(p_collection)) {
+            ggsave(file.path(current_output_path, 
+                            paste0(cell_line, "_GSEA_", collection, ".svg")),
+                   plot = p_collection, width = 10, height = 12, dpi = 300)
+          }
+        }
+        
+        message(paste("  Found", nrow(gsea_results), "significant pathways"))
+        
+      } else {
+        message(paste("  No significant pathways found for", cell_line))
+      }
+    }
+    
+    # Generate summary statistics
+    message("\nGenerating summary statistics...")
+    summary_stats <- generate_gsea_summary(all_results, current_output_path)
+    
+    if (!is.null(summary_stats)) {
+      message(paste("\n=== GSEA Summary for", 
+                   ifelse(current_gene_type == "unique", "Unique Genes", "All DEGs"),
+                   "at", time_point, "==="))
+      print(summary_stats)
+    }
+    
+    # Create cross-cell line comparison
+    if (length(all_results) > 0) {
+      message("\nCreating cross-cell line comparisons...")
+      
+      # ER stress and UPR pathways
+      er_comparison <- create_cross_cellline_comparison(
+        all_results,
+        pathway_pattern = "UNFOLDED_PROTEIN|ENDOPLASMIC_RETICULUM|STRESS|RESPONSE_TO_ER",
+        output_path = current_output_path,
+        time_point = time_point  # Pass time point for labeling
+      )
+      
+      # Apoptosis pathways
+      apoptosis_comparison <- create_cross_cellline_comparison(
+        all_results,
+        pathway_pattern = "APOPTOSIS|CELL_DEATH|CASPASE",
+        output_path = current_output_path,
+        time_point = time_point
+      )
+      
+      # Metabolic pathways
+      metabolic_comparison <- create_cross_cellline_comparison(
+        all_results,
+        pathway_pattern = "GLYCOLYSIS|OXIDATIVE|METABOLISM|MITOCHONDR",
+        output_path = current_output_path,
+        time_point = time_point
+      )
+    }
+    
+    # Save all results as RDS for future use
+    saveRDS(all_results, 
+            file.path(current_output_path, "all_GSEA_results.rds"))
+    
+    # Store in master results
+    master_results[[current_gene_type]] <- list(
+      results = all_results,
+      plots = all_plots,
+      summary = summary_stats
+    )
+  }
+  
+  # Create comparison between unique vs all DEGs if both were analyzed
+  if (length(master_results) == 2) {
+    message("\n--- Creating comparison between Unique and All DEGs ---")
+    create_unique_vs_all_comparison(master_results, output_path, time_point)
+  }
+  
+  message("\n========================================")
+  message(paste("GSEA Analysis Complete for", time_point, "!"))
+  message(paste("Results saved to:", output_path))
+  message("========================================\n")
+  
+  return(master_results)
+}
+
+#' Compare GSEA results between unique genes and all DEGs
+#' Added time_point parameter for proper labeling
+#' @param master_results Results from both analyses
+#' @param output_path Path to save comparison
+#' @param time_point Time point being analyzed
+create_unique_vs_all_comparison <- function(master_results, output_path, time_point = NULL) {
+  
+  comparison_path <- file.path(output_path, "comparison")
+  dir.create(comparison_path, showWarnings = FALSE, recursive = TRUE)
+  
+  # Extract top pathways from each analysis
+  comparison_data <- list()
+  
+  for (gene_type in names(master_results)) {
+    results <- master_results[[gene_type]]$results
+    
+    for (cell_line in names(results)) {
+      if (!is.null(results[[cell_line]])) {
+        df <- results[[cell_line]]
+        df$cell_line <- cell_line
+        df$gene_type <- gene_type
+        
+        # Keep only top pathways
+        df <- df[order(abs(df$NES), decreasing = TRUE), ]
+        df <- head(df, 50)
+        
+        comparison_data[[paste(gene_type, cell_line, sep = "_")]] <- df
+      }
+    }
+  }
+  
+  if (length(comparison_data) > 0) {
+    combined <- do.call(rbind, comparison_data)
+    
+    # Convert list columns before saving
+    combined_writable <- convert_list_columns_to_char(combined)
+    
+    # Save comparison table
+    write.table(combined_writable,
+                file.path(comparison_path, "unique_vs_all_comparison.txt"),
+                sep = "\t", row.names = FALSE, quote = FALSE)
+    
+    # Create visualization comparing pathway enrichment
+    # Focus on pathways that appear in both analyses
+    pathway_counts <- table(combined$pathway)
+    common_pathways <- names(pathway_counts[pathway_counts > 1])
+    
+    if (length(common_pathways) > 0) {
+      common_data <- combined[combined$pathway %in% common_pathways, ]
+      
+      # Clean pathway names
+      common_data$pathway_clean <- gsub("^[A-Z]+_", "", common_data$pathway)
+      common_data$pathway_clean <- gsub("_", " ", common_data$pathway_clean)
+      common_data$pathway_clean <- stringr::str_to_title(common_data$pathway_clean)
+      
+      # Select top pathways
+      top_pathways <- unique(head(common_data$pathway, 30))
+      plot_data <- common_data[common_data$pathway %in% top_pathways, ]
+      
+      # Create comparison plot
+      title_text <- paste("Pathway Enrichment: Unique Genes vs All DEGs",
+                         ifelse(!is.null(time_point), paste("at", time_point), ""))
+      
+      p <- ggplot(plot_data, aes(x = cell_line, y = pathway_clean, fill = NES)) +
+        geom_tile(color = "white") +
+        facet_wrap(~ gene_type, ncol = 2) +
+        scale_fill_gradient2(
+          low = "blue", mid = "white", high = "red",
+          midpoint = 0, name = "NES"
+        ) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 8),
+          strip.text = element_text(size = 12, face = "bold")
+        ) +
+        labs(
+          title = title_text,
+          x = "Cell Line",
+          y = "Pathway"
+        )
+      
+      ggsave(file.path(comparison_path, "unique_vs_all_heatmap.svg"),
+             plot = p, width = 14, height = 10, dpi = 300)
+    }
+  }
+}
+
+################################################################################
+### SECTION 7: COMPARATIVE ANALYSIS
+################################################################################
+
+#' Create comparison plot across cell lines
+#' Added time_point parameter for proper file naming and labeling
+#' @param all_results List of GSEA results for all cell lines
+#' @param pathway_pattern Pattern to match pathways of interest
+#' @param output_path Path to save plot
+#' @param time_point Time point being analyzed (for labeling)
+#' @return ggplot object
+create_cross_cellline_comparison <- function(all_results, 
+                                            pathway_pattern = "UNFOLDED_PROTEIN|STRESS|APOPTOSIS",
+                                            output_path = "analysis/GSEA_results",
+                                            time_point = NULL) {
+  
+  # Combine results from all cell lines
+  combined <- list()
+  
+  for (cell_line in names(all_results)) {
+    if (!is.null(all_results[[cell_line]])) {
+      df <- all_results[[cell_line]]
+      df$cell_line <- cell_line
+      combined[[cell_line]] <- df
+    }
+  }
+  
+  if (length(combined) == 0) {
+    return(NULL)
+  }
+  
+  combined_df <- do.call(rbind, combined)
+  
+  # Filter for pathways of interest
+  if (!is.null(pathway_pattern)) {
+    combined_df <- combined_df[grepl(pathway_pattern, combined_df$pathway, ignore.case = TRUE), ]
+  }
+  
+  if (nrow(combined_df) == 0) {
+    return(NULL)
+  }
+  
+  # Clean pathway names
+  combined_df$pathway_clean <- gsub("^[A-Z]+_", "", combined_df$pathway)
+  combined_df$pathway_clean <- gsub("_", " ", combined_df$pathway_clean)
+  combined_df$pathway_clean <- stringr::str_to_title(combined_df$pathway_clean)
+  
+  # Optionally save the filtered pathway data
+  if (nrow(combined_df) > 0) {
+    # Convert list columns before saving
+    combined_df_writable <- convert_list_columns_to_char(combined_df)
+    
+    # Include time point in filename if provided
+    filename <- ifelse(!is.null(time_point),
+                      paste0("Cross_cellline_pathways_", time_point, ".txt"),
+                      "Cross_cellline_pathways.txt")
+    
+    write.table(combined_df_writable,
+                file.path(output_path, filename),
+                sep = "\t", row.names = FALSE, quote = FALSE)
+  }
+  
+  # Create heatmap-style plot
+  title_text <- paste("Pathway Enrichment Across Cell Lines",
+                     ifelse(!is.null(time_point), paste("at", time_point), ""))
+  
+  p <- ggplot(combined_df, aes(x = cell_line, y = pathway_clean, fill = NES)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = ifelse(padj < 0.001, "***",
+                                 ifelse(padj < 0.01, "**",
+                                       ifelse(padj < 0.05, "*", "")))),
+             color = "black", size = 4) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red",
+      midpoint = 0, name = "NES",
+      limits = c(-3, 3),
+      oob = scales::squish
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 10),
+      axis.title = element_blank(),
+      legend.position = "right",
+      panel.grid = element_blank(),
+      panel.border = element_rect(fill = NA, color = "black")
+    ) +
+    labs(title = title_text)
+  
+  # Save plot with time point in filename
+  svg_filename <- ifelse(!is.null(time_point),
+                        paste0("Cross_cellline_pathway_comparison_", time_point, ".svg"),
+                        "Cross_cellline_pathway_comparison.svg")
+  
+  ggsave(file.path(output_path, svg_filename),
+         plot = p, width = 10, height = 8, dpi = 300)
+  
+  return(p)
+}
+
+################################################################################
+### SECTION 8: EXECUTE THE ANALYSIS
+################################################################################
+
+if (interactive()) {
+  
+  # Run separate analyses for 6h and 24h
+  
+  # Run 6h analysis
+  message("\n##################################################")
+  message("## Running 6h Analysis")
+  message("##################################################\n")
+  
+  gsea_6h <- run_gsea_analysis(
+    time_point = "6h", 
+    gene_type = "all",
+    ranking_metric = "logFC",  # Use Broad GSEA-like ranking
+    output_path = "analysis/GSEA_6h",
+    use_collections = c("Hallmark", "KEGG", "GO_BP")
+  )
+  
+  # Run 24h analysis  
+  message("\n##################################################")
+  message("## Running 24h Analysis")
+  message("##################################################\n")
+  
+  gsea_24h <- run_gsea_analysis(
+    time_point = "24h", 
+    gene_type = "all",
+    ranking_metric = "logFC",  # Use Broad GSEA-like ranking
+    output_path = "analysis/GSEA_24h",
+    use_collections = c("Hallmark", "KEGG", "GO_BP")
+  )
+  
+  # Create additional cross-cell line comparisons for 6h results
+  if (exists("gsea_6h") && length(gsea_6h) > 0) {
+    
+    message("\n--- Creating additional comparisons for 6h results ---")
+    
+    # For unique genes results
+    if ("unique" %in% names(gsea_6h) && length(gsea_6h$unique$results) > 0) {
+      # ER stress pathways
+      er_stress_comparison_6h <- create_cross_cellline_comparison(
+        gsea_6h$unique$results,
+        pathway_pattern = "UNFOLDED_PROTEIN|STRESS|APOPTOSIS|RESPONSE_TO_ER",
+        output_path = "analysis/GSEA_6h/unique_genes",
+        time_point = "6h"
+      )
+      
+      # Metabolic pathways
+      metabolic_comparison_6h <- create_cross_cellline_comparison(
+        gsea_6h$unique$results,
+        pathway_pattern = "OXIDATIVE|HYPOXIA|GLYCOLYSIS|MITOCHONDR",
+        output_path = "analysis/GSEA_6h/unique_genes",
+        time_point = "6h"
+      )
+    }
+    
+    # For all DEGs results
+    if ("all" %in% names(gsea_6h) && length(gsea_6h$all$results) > 0) {
+      # Cell identity pathways
+      identity_comparison_6h <- create_cross_cellline_comparison(
+        gsea_6h$all$results,
+        pathway_pattern = "PANCREAS|BETA_CELL|INSULIN|SECRETION",
+        output_path = "analysis/GSEA_6h/all_DEGs",
+        time_point = "6h"
+      )
+      
+      # Inflammatory pathways
+      inflammation_comparison_6h <- create_cross_cellline_comparison(
+        gsea_6h$all$results,
+        pathway_pattern = "INFLAMMATORY|CYTOKINE|INTERFERON|TNF",
+        output_path = "analysis/GSEA_6h/all_DEGs",
+        time_point = "6h"
+      )
+    }
+  }
+  
+  # Create additional cross-cell line comparisons for 24h results
+  if (exists("gsea_24h") && length(gsea_24h) > 0) {
+    
+    message("\n--- Creating additional comparisons for 24h results ---")
+    
+    # For unique genes results
+    if ("unique" %in% names(gsea_24h) && length(gsea_24h$unique$results) > 0) {
+      # ER stress pathways
+      er_stress_comparison_24h <- create_cross_cellline_comparison(
+        gsea_24h$unique$results,
+        pathway_pattern = "UNFOLDED_PROTEIN|STRESS|APOPTOSIS|RESPONSE_TO_ER",
+        output_path = "analysis/GSEA_24h/unique_genes",
+        time_point = "24h"
+      )
+      
+      # Metabolic pathways
+      metabolic_comparison_24h <- create_cross_cellline_comparison(
+        gsea_24h$unique$results,
+        pathway_pattern = "OXIDATIVE|HYPOXIA|GLYCOLYSIS|MITOCHONDR",
+        output_path = "analysis/GSEA_24h/unique_genes",
+        time_point = "24h"
+      )
+    }
+    
+    # For all DEGs results
+    if ("all" %in% names(gsea_24h) && length(gsea_24h$all$results) > 0) {
+      # Cell identity pathways
+      identity_comparison_24h <- create_cross_cellline_comparison(
+        gsea_24h$all$results,
+        pathway_pattern = "PANCREAS|BETA_CELL|INSULIN|SECRETION",
+        output_path = "analysis/GSEA_24h/all_DEGs",
+        time_point = "24h"
+      )
+      
+      # Inflammatory pathways
+      inflammation_comparison_24h <- create_cross_cellline_comparison(
+        gsea_24h$all$results,
+        pathway_pattern = "INFLAMMATORY|CYTOKINE|INTERFERON|TNF",
+        output_path = "analysis/GSEA_24h/all_DEGs",
+        time_point = "24h"
+      )
+    }
+  }
+  
+  # Print summary of what was analyzed
+  message("\n=== Analysis Summary ===")
+  
+  if (exists("gsea_6h")) {
+    message("\n6h ANALYSIS:")
+    for (analysis_type in names(gsea_6h)) {
+      message(paste("\n", toupper(analysis_type), "GENES:"))
+      if (!is.null(gsea_6h[[analysis_type]]$summary)) {
+        print(gsea_6h[[analysis_type]]$summary)
+      }
+    }
+  }
+  
+  if (exists("gsea_24h")) {
+    message("\n24h ANALYSIS:")
+    for (analysis_type in names(gsea_24h)) {
+      message(paste("\n", toupper(analysis_type), "GENES:"))
+      if (!is.null(gsea_24h[[analysis_type]]$summary)) {
+        print(gsea_24h[[analysis_type]]$summary)
+      }
+    }
+  }
+  
+  message("\n========================================")
+  message("All analyses complete!")
+  message("========================================")
+}
+
+writeLines(capture.output(sessionInfo()), "session_info/05_GSEA_analysis_unique_genes_sessioninfo.txt")
+
