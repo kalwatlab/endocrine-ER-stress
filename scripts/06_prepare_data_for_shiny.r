@@ -2,8 +2,6 @@
 ### Script 06: Data Preparation for Shiny Deployment
 ################################################################################
 
-# check that you are in the Shiny app directory before running
-
 library(tidyverse)
 library(jsonlite)
 
@@ -180,40 +178,96 @@ prepare_enhanced_shiny_data <- function(
     message(paste("  Upset data saved:", length(upset_data), "gene sets"))
   }
   
-  # 4. Copy unique gene sets
   if (include_unique) {
     message("\nProcessing unique gene sets...")
     
-    unique_dir <- "analysis/custom_gene_sets/both"
-    if (dir.exists(unique_dir)) {
-      # Read all unique gene set files
-      unique_files <- list.files(unique_dir, pattern = "\\.txt$", full.names = TRUE)
-      unique_gene_sets <- list()
+    unique_gene_sets <- list()
+    
+    # Process both 6h and 24h directories
+    for (time_point in c("6h", "24h")) {
+      unique_dir <- file.path("analysis/custom_gene_sets", time_point)
       
-      for (file in unique_files) {
-        set_name <- gsub("\\.txt$", "", basename(file))
-        genes <- readLines(file)
-        genes <- genes[genes != "" & !is.na(genes)]
+      if (dir.exists(unique_dir)) {
+        message(paste("  Processing", time_point, "unique gene sets..."))
         
-        if (length(genes) > 0) {
-          unique_gene_sets[[set_name]] <- genes
+        # Option 1: Read the RDS file with all gene sets (recommended)
+        rds_file <- file.path(unique_dir, paste0("all_unique_gene_sets_", time_point, ".rds"))
+        if (file.exists(rds_file)) {
+          time_gene_sets <- readRDS(rds_file)
+          
+          # Add time point to the set names if not already included
+          for (set_name in names(time_gene_sets)) {
+            # Check if time point is already in the name
+            if (!grepl(time_point, set_name)) {
+              new_name <- paste0(set_name, "_", time_point)
+            } else {
+              new_name <- set_name
+            }
+            unique_gene_sets[[new_name]] <- time_gene_sets[[set_name]]
+          }
+          
+          message(paste("    Loaded", length(time_gene_sets), "gene sets from", time_point))
+        } else {
+          # Option 2: Fall back to reading individual text files
+          message(paste("    RDS file not found, reading individual files for", time_point))
+          
+          unique_files <- list.files(unique_dir, pattern = "\\.txt$", full.names = TRUE)
+          
+          # Exclude the summary file
+          unique_files <- unique_files[!grepl("summary", unique_files)]
+          
+          for (file in unique_files) {
+            set_name <- gsub("\\.txt$", "", basename(file))
+            genes <- readLines(file)
+            genes <- genes[genes != "" & !is.na(genes)]
+            
+            if (length(genes) > 0) {
+              unique_gene_sets[[set_name]] <- genes
+            }
+          }
+          
+          message(paste("    Loaded", length(unique_files), "gene set files from", time_point))
         }
+      } else {
+        message(paste("  Warning: Directory not found:", unique_dir))
       }
-      
-      # Save unique gene sets
+    }
+    
+    if (length(unique_gene_sets) > 0) {
+      # Save combined unique gene sets
       saveRDS(unique_gene_sets, 
-             file.path(output_dir, "data", "unique_gene_sets.rds"))
+              file.path(output_dir, "data", "unique_gene_sets.rds"))
       
-      # Create summary
+      # Create summary with better organization
       unique_summary <- data.frame(
         gene_set = names(unique_gene_sets),
-        n_genes = sapply(unique_gene_sets, length)
+        n_genes = sapply(unique_gene_sets, length),
+        stringsAsFactors = FALSE
       )
-      write.table(unique_summary, 
-                 file.path(output_dir, "data", "unique_gene_sets_summary.txt"),
-                 sep = "\t", row.names = FALSE, quote = FALSE)
       
-      message(paste("  Unique gene sets saved:", length(unique_gene_sets), "sets"))
+      # Extract metadata from gene set names
+      unique_summary$cell_line <- gsub("_unique.*", "", unique_summary$gene_set)
+      unique_summary$time_point <- ifelse(grepl("_6h", unique_summary$gene_set), "6h", 
+                                          ifelse(grepl("_24h", unique_summary$gene_set), "24h", "unknown"))
+      unique_summary$direction <- ifelse(grepl("_UP_", unique_summary$gene_set), "UP",
+                                         ifelse(grepl("_DOWN_", unique_summary$gene_set), "DOWN",
+                                                ifelse(grepl("_combined_", unique_summary$gene_set), "combined",
+                                                       ifelse(grepl("_ALL_", unique_summary$gene_set), "ALL", "mixed"))))
+      
+      # Sort by cell line, time point, and direction
+      unique_summary <- unique_summary[order(unique_summary$cell_line, 
+                                             unique_summary$time_point, 
+                                             unique_summary$direction), ]
+      
+      write.table(unique_summary, 
+                  file.path(output_dir, "data", "unique_gene_sets_summary.txt"),
+                  sep = "\t", row.names = FALSE, quote = FALSE)
+      
+      message(paste("  Unique gene sets saved:", length(unique_gene_sets), "sets total"))
+      message(paste("    6h sets:", sum(grepl("_6h", names(unique_gene_sets)))))
+      message(paste("    24h sets:", sum(grepl("_24h", names(unique_gene_sets)))))
+    } else {
+      message("  Warning: No unique gene sets found")
     }
   }
   

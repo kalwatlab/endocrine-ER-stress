@@ -2156,8 +2156,6 @@ if(run_GO_analysis == TRUE){
   return(results)
 }
 
-comparison_results <- run_concordant_discordant_analysis()
-
 ################################################################################
 ### SECTION 10: EXECUTE THE ANALYSIS
 ################################################################################
@@ -2171,6 +2169,15 @@ if (interactive()) {
     mouse_symbol_file = NULL,  # Set to path of JAX MGI file if available
     run_GO_analysis = TRUE    # set to false if you don't need to regen the whole GO analysis - it takes a long time to run.
   )
+  
+  # Run concordant/discordant analysis after main analysis completes
+  message("\n=== Running Concordant/Discordant Analysis ===")
+  concordant_discordant_results <- tryCatch({
+    run_concordant_discordant_analysis()
+  }, error = function(e) {
+    message(paste("Error in concordant/discordant analysis:", e$message))
+    NULL
+  })
   
   # Print summary statistics for both time points
   message("\n=== Summary Statistics ===")

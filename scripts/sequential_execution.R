@@ -1,6 +1,4 @@
-# Be sure that working dir is set to the project director setwd("path/to/your/project")
-
-# If any modifications are needed to the pipeline after running the shiny app, must remember to switch working dir or you will get issues with file saving and data imports.
+# Be sure that working dir is set to the project directory e.g. setwd("path/to/your/project")
 
 setwd("~/RNAseq/endocrine-ER-stress")
 
@@ -11,11 +9,10 @@ source("scripts/02_Comparative_Analysis_Pipeline.R")
 source("scripts/03_Granular_Analysis_DotPlots.R")
 source("scripts/04_Custom_Unique_genesets_DotPlots.R")
 source("scripts/05_GSEA_Analysis_Unique_Genes.R")
+source("scripts/06_prepare_data_for_shiny.r")
 
-setwd("RNAseq_Shiny_App/")  # switch working dir to the shiny app dir
-
-source("scripts/06_prepare_data_for_shiny.R")
-
-source("app.R") # execute app.R to use the app
+setwd("RNAseq_Shiny_App/")
+source("app.R") # source app.R to load everything - be sure to switch working dir to the shiny app directory before running the app
+shiny::runApp("app.R") # run the app
 
 # source("deploy.R") # this deploys the app.R to shinyapps.io
